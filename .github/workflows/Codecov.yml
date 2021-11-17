@@ -1,0 +1,23 @@
+name: Codecov
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+      with: 
+        fetch-depth: 2
+    - name: Set up Go
+      uses: actions/setup-go@v2
+      with:
+        go-version: 1.17
+    - name: init module
+      run: go mod init caculator
+    - name: Run coverage 
+      run: go test -race -coverprofile=coverage.txt -covermode=atomic      
+    - name: Upload coverage to CodeCov
+      uses: codecov/codecov-action@v1
+      with:
+        token: cfd657c0-1e75-4b4b-a259-6b9d69893da7
