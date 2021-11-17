@@ -19,5 +19,3 @@ jobs:
       run: go test -race -coverprofile=coverage.txt -covermode=atomic      
     - name: Upload coverage to CodeCov
       uses: codecov/codecov-action@v1
-      with:
-        token: cfd657c0-1e75-4b4b-a259-6b9d69893da7
