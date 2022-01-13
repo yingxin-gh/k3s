@@ -70,3 +70,25 @@ jobs:
         files: ./coverage.out
         flags: inttests # optional
         verbose: true # optional (default = false)
+
+# generate provenance https://github.com/slsa-framework/github-actions-demo   
+  generate-provenance:
+    needs: build
+    name: Generate build provenance
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v2
+        with:
+          name: k3s
+          path: ./dist/artifacts
+
+      - name: Generate provenance
+        uses: slsa-framework/github-actions-demo@v0.1
+        with:
+          artifact_path: ./dist/artifacts/k3s
+
+      - name: Upload provenance
+        uses: actions/upload-artifact@v2
+        with:
+          path: build.provenance
