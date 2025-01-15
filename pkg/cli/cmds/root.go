@@ -5,18 +5,21 @@ import (
 	"os"
 	"runtime"
 
-	"github.com/rancher/k3s/pkg/version"
-	"github.com/sirupsen/logrus"
+	"github.com/k3s-io/k3s/pkg/version"
 	"github.com/urfave/cli"
 )
 
 var (
 	Debug     bool
-	DebugFlag = cli.BoolFlag{
+	DebugFlag = &cli.BoolFlag{
 		Name:        "debug",
 		Usage:       "(logging) Turn on debug logs",
 		Destination: &Debug,
 		EnvVar:      version.ProgramUpper + "_DEBUG",
+	}
+	PreferBundledBin = &cli.BoolFlag{
+		Name:  "prefer-bundled-bin",
+		Usage: "(experimental) Prefer bundled userspace binaries over host binaries",
 	}
 )
 
@@ -38,24 +41,8 @@ func NewApp() *cli.App {
 	}
 	app.Flags = []cli.Flag{
 		DebugFlag,
-		cli.StringFlag{
-			Name:  "data-dir,d",
-			Usage: "(data) Folder to hold state default /var/lib/rancher/" + version.Program + " or ${HOME}/.rancher/" + version.Program + " if not root",
-		},
+		DataDirFlag,
 	}
-	app.Before = SetupDebug(nil)
 
 	return app
-}
-
-func SetupDebug(next func(ctx *cli.Context) error) func(ctx *cli.Context) error {
-	return func(ctx *cli.Context) error {
-		if Debug {
-			logrus.SetLevel(logrus.DebugLevel)
-		}
-		if next != nil {
-			return next(ctx)
-		}
-		return nil
-	}
 }

@@ -4,32 +4,34 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"net"
 	"os"
-	"path"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/go-test/deep"
+	"github.com/k3s-io/k3s/pkg/bootstrap"
+	"github.com/k3s-io/k3s/pkg/clientaccess"
+	"github.com/k3s-io/k3s/pkg/daemons/config"
+	"github.com/k3s-io/k3s/pkg/etcd"
+	"github.com/k3s-io/k3s/pkg/util"
+	"github.com/k3s-io/k3s/pkg/version"
 	"github.com/k3s-io/kine/pkg/client"
 	"github.com/k3s-io/kine/pkg/endpoint"
-	"github.com/rancher/k3s/pkg/bootstrap"
-	"github.com/rancher/k3s/pkg/clientaccess"
-	"github.com/rancher/k3s/pkg/daemons/config"
-	"github.com/rancher/k3s/pkg/daemons/executor"
-	"github.com/rancher/k3s/pkg/etcd"
-	"github.com/rancher/k3s/pkg/version"
+	"github.com/otiai10/copy"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
-	"go.etcd.io/etcd/server/v3/embed"
 )
 
 // Bootstrap attempts to load a managed database driver, if one has been initialized or should be created/joined.
 // It then checks to see if the cluster needs to load bootstrap data, and if so, loads data into the
-// ControlRuntimeBoostrap struct, either via HTTP or from the datastore.
-func (c *Cluster) Bootstrap(ctx context.Context, snapshot bool) error {
+// ControlRuntimeBootstrap struct, either via HTTP or from the datastore.
+func (c *Cluster) Bootstrap(ctx context.Context, clusterReset bool) error {
 	if err := c.assignManagedDriver(ctx); err != nil {
 		return err
 	}
@@ -41,66 +43,26 @@ func (c *Cluster) Bootstrap(ctx context.Context, snapshot bool) error {
 	c.shouldBootstrap = shouldBootstrap
 
 	if c.managedDB != nil {
-		if !snapshot {
+		if !clusterReset {
+			isHTTP := c.config.JoinURL != "" && c.config.Token != ""
+			// For secondary servers, we attempt to connect and reconcile with the datastore.
+			// If that fails we fallback to the local etcd cluster start
+			if isInitialized && isHTTP && c.clientAccessInfo != nil {
+				if err := c.httpBootstrap(ctx); err == nil {
+					logrus.Info("Successfully reconciled with datastore")
+					return nil
+				}
+				logrus.Warnf("Unable to reconcile with datastore: %v", err)
+			}
 			// In the case of etcd, if the database has been initialized, it doesn't
 			// need to be bootstrapped however we still need to check the database
 			// and reconcile the bootstrap data. Below we're starting a temporary
 			// instance of etcd in the event that etcd certificates are unavailable,
 			// reading the data, and comparing that to the data on disk, all the while
 			// starting normal etcd.
-			isHTTP := c.config.JoinURL != "" && c.config.Token != ""
-			if isInitialized && !isHTTP {
-				tmpDataDir := filepath.Join(c.config.DataDir, "db", "tmp-etcd")
-				os.RemoveAll(tmpDataDir)
-				if err := os.Mkdir(tmpDataDir, 0700); err != nil {
-					return err
-				}
-				etcdDataDir := etcd.DBDir(c.config)
-				if err := createTmpDataDir(etcdDataDir, tmpDataDir); err != nil {
-					return err
-				}
-				defer func() {
-					if err := os.RemoveAll(tmpDataDir); err != nil {
-						logrus.Warn("failed to remove etcd temp dir", err)
-					}
-				}()
-
-				args := executor.ETCDConfig{
-					DataDir:           tmpDataDir,
-					ForceNewCluster:   true,
-					ListenClientURLs:  "http://127.0.0.1:2399",
-					Logger:            "zap",
-					HeartbeatInterval: 500,
-					ElectionTimeout:   5000,
-					LogOutputs:        []string{"stderr"},
-				}
-				configFile, err := args.ToConfigFile(c.config.ExtraEtcdArgs)
-				if err != nil {
-					return err
-				}
-				cfg, err := embed.ConfigFromFile(configFile)
-				if err != nil {
-					return err
-				}
-
-				etcd, err := embed.StartEtcd(cfg)
-				if err != nil {
-					return err
-				}
-				defer etcd.Close()
-
-				data, err := c.retrieveInitializedDBdata(ctx)
-				if err != nil {
-					return err
-				}
-
-				ec := endpoint.ETCDConfig{
-					Endpoints:   []string{"http://127.0.0.1:2399"},
-					LeaderElect: false,
-				}
-
-				if err := c.ReconcileBootstrapData(ctx, bytes.NewReader(data.Bytes()), &c.config.Runtime.ControlRuntimeBootstrap, false, &ec); err != nil {
-					logrus.Fatal(err)
+			if isInitialized {
+				if err := c.reconcileEtcd(ctx); err != nil {
+					logrus.Fatalf("Failed to reconcile with temporary etcd: %v", err)
 				}
 			}
 		}
@@ -113,82 +75,18 @@ func (c *Cluster) Bootstrap(ctx context.Context, snapshot bool) error {
 	return nil
 }
 
-// copyFile copies the contents of the src file
-// to the given destination file.
-func copyFile(src, dst string) error {
-	srcfd, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer srcfd.Close()
-
-	dstfd, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer dstfd.Close()
-
-	if _, err = io.Copy(dstfd, srcfd); err != nil {
-		return err
-	}
-
-	srcinfo, err := os.Stat(src)
-	if err != nil {
-		return err
-	}
-
-	return os.Chmod(dst, srcinfo.Mode())
-}
-
-// createTmpDataDir creates a temporary directory and copies the
-// contents of the original etcd data dir to be used
-// by etcd when reading data.
-func createTmpDataDir(src, dst string) error {
-	srcinfo, err := os.Stat(src)
-	if err != nil {
-		return err
-	}
-
-	if err := os.MkdirAll(dst, srcinfo.Mode()); err != nil {
-		return err
-	}
-
-	fds, err := ioutil.ReadDir(src)
-	if err != nil {
-		return err
-	}
-
-	for _, fd := range fds {
-		srcfp := path.Join(src, fd.Name())
-		dstfp := path.Join(dst, fd.Name())
-
-		if fd.IsDir() {
-			if err = createTmpDataDir(srcfp, dstfp); err != nil {
-				fmt.Println(err)
-			}
-		} else {
-			if err = copyFile(srcfp, dstfp); err != nil {
-				fmt.Println(err)
-			}
-		}
-	}
-
-	return nil
-}
-
 // shouldBootstrapLoad returns true if we need to load ControlRuntimeBootstrap data again and a second boolean
 // indicating that the server has or has not been initialized, if etcd. This is controlled by a stamp file on
 // disk that records successful bootstrap using a hash of the join token.
 func (c *Cluster) shouldBootstrapLoad(ctx context.Context) (bool, bool, error) {
 	// Non-nil managedDB indicates that the database is either initialized, initializing, or joining
 	if c.managedDB != nil {
-		c.runtime.HTTPBootstrap = true
+		c.config.Runtime.HTTPBootstrap = true
 
-		isInitialized, err := c.managedDB.IsInitialized(ctx, c.config)
+		isInitialized, err := c.managedDB.IsInitialized()
 		if err != nil {
 			return false, false, err
 		}
-
 		if isInitialized {
 			// If the database is initialized we skip bootstrapping; if the user wants to rejoin a
 			// cluster they need to delete the database.
@@ -197,7 +95,7 @@ func (c *Cluster) shouldBootstrapLoad(ctx context.Context) (bool, bool, error) {
 			// etcd is promoted from learner. Odds are we won't need this info, and we don't want to fail startup
 			// due to failure to retrieve it as this will break cold cluster restart, so we ignore any errors.
 			if c.config.JoinURL != "" && c.config.Token != "" {
-				c.clientAccessInfo, _ = clientaccess.ParseAndValidateTokenForUser(c.config.JoinURL, c.config.Token, "server")
+				c.clientAccessInfo, _ = clientaccess.ParseAndValidateToken(c.config.JoinURL, c.config.Token, clientaccess.WithUser("server"))
 			}
 			return false, true, nil
 		} else if c.config.JoinURL == "" {
@@ -212,7 +110,7 @@ func (c *Cluster) shouldBootstrapLoad(ctx context.Context) (bool, bool, error) {
 
 			// Fail if the token isn't syntactically valid, or if the CA hash on the remote server doesn't match
 			// the hash in the token. The password isn't actually checked until later when actually bootstrapping.
-			info, err := clientaccess.ParseAndValidateTokenForUser(c.config.JoinURL, c.config.Token, "server")
+			info, err := clientaccess.ParseAndValidateToken(c.config.JoinURL, c.config.Token, clientaccess.WithUser("server"))
 			if err != nil {
 				return false, false, err
 			}
@@ -221,15 +119,6 @@ func (c *Cluster) shouldBootstrapLoad(ctx context.Context) (bool, bool, error) {
 			c.clientAccessInfo = info
 		}
 	}
-
-	// Check the stamp file to see if we have successfully bootstrapped using this token.
-	// NOTE: The fact that we use a hash of the token to generate the stamp
-	//       means that it is unsafe to use the same token for multiple clusters.
-	// stamp := c.bootstrapStamp()
-	// if _, err := os.Stat(stamp); err == nil {
-	// 	logrus.Info("Cluster bootstrap already complete")
-	// 	return false, nil
-	// }
 
 	// No errors and no bootstrap stamp, need to bootstrap.
 	return true, false, nil
@@ -313,24 +202,54 @@ func migrateBootstrapData(ctx context.Context, data io.Reader, files bootstrap.P
 
 const systemTimeSkew = int64(3)
 
+// isMigrated checks to see if the given bootstrap data
+// is in the latest format.
+func isMigrated(buf io.ReadSeeker, files *bootstrap.PathsDataformat) bool {
+	buf.Seek(0, 0)
+	defer buf.Seek(0, 0)
+
+	if err := json.NewDecoder(buf).Decode(files); err != nil {
+		// This will fail if data is being pulled from old an cluster since
+		// older clusters used a map[string][]byte for the data structure.
+		// Therefore, we need to perform a migration to the newer bootstrap
+		// format; bootstrap.BootstrapFile.
+		return false
+	}
+
+	return true
+}
+
 // ReconcileBootstrapData is called before any data is saved to the
 // datastore or locally. It checks to see if the contents of the
 // bootstrap data in the datastore is newer than on disk or different
-// and depending on where the difference is, the newer data is written
-// to disk or if the disk is newer, the process is stopped and a error
-// is issued.
-func (c *Cluster) ReconcileBootstrapData(ctx context.Context, buf io.ReadSeeker, crb *config.ControlRuntimeBootstrap, isHTTP bool, ec *endpoint.ETCDConfig) error {
+// and depending on where the difference is. If the datastore is newer,
+// then the data will be written to disk. If the data on disk is newer,
+// k3s will exit with an error.
+func (c *Cluster) ReconcileBootstrapData(ctx context.Context, buf io.ReadSeeker, crb *config.ControlRuntimeBootstrap, isHTTP bool) error {
 	logrus.Info("Reconciling bootstrap data between datastore and disk")
 
 	if err := c.certDirsExist(); err != nil {
-		return bootstrap.WriteToDiskFromStorage(buf, crb)
+		// we need to see if the data has been migrated before writing to disk. This
+		// is because the data may have been given to us via the HTTP bootstrap process
+		// from an older version of k3s. That version might not have the new data format
+		// and we should write the correct format.
+		files := make(bootstrap.PathsDataformat)
+		if !isMigrated(buf, &files) {
+			if err := migrateBootstrapData(ctx, buf, files); err != nil {
+				return err
+			}
+			buf.Seek(0, 0)
+		}
+
+		logrus.Debugf("One or more certificate directories do not exist; writing data to disk from datastore")
+		return bootstrap.WriteToDiskFromStorage(files, crb)
 	}
 
 	var dbRawData []byte
 	if c.managedDB != nil && !isHTTP {
 		token := c.config.Token
 		if token == "" {
-			tokenFromFile, err := readTokenFromFile(c.runtime.ServerToken, c.runtime.ServerCA, c.config.DataDir)
+			tokenFromFile, err := util.ReadTokenFromFile(c.config.Runtime.ServerToken, c.config.Runtime.ServerCA, c.config.DataDir)
 			if err != nil {
 				return err
 			}
@@ -342,50 +261,30 @@ func (c *Cluster) ReconcileBootstrapData(ctx context.Context, buf io.ReadSeeker,
 			token = tokenFromFile
 		}
 
-		normalizedToken, err := normalizeToken(token)
+		normalizedToken, err := util.NormalizeToken(token)
 		if err != nil {
 			return err
 		}
 
 		var value *client.Value
 
-		var etcdConfig endpoint.ETCDConfig
-		if ec != nil {
-			etcdConfig = *ec
-		} else {
-			etcdConfig = c.etcdConfig
-		}
-
-		storageClient, err := client.New(etcdConfig)
+		storageClient, err := client.New(c.config.Runtime.EtcdConfig)
 		if err != nil {
 			return err
 		}
+		defer storageClient.Close()
 
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
+		value, c.saveBootstrap, err = getBootstrapKeyFromStorage(ctx, storageClient, normalizedToken, token)
+		if err != nil {
+			return err
+		}
+		if value == nil {
+			return nil
+		}
 
-	RETRY:
-		for {
-			value, err = c.getBootstrapKeyFromStorage(ctx, storageClient, normalizedToken, token)
-			if err != nil {
-				if strings.Contains(err.Error(), "not supported for learner") {
-					for range ticker.C {
-						continue RETRY
-					}
-
-				}
-				return err
-			}
-			if value == nil {
-				return nil
-			}
-
-			dbRawData, err = decrypt(normalizedToken, value.Data)
-			if err != nil {
-				return err
-			}
-
-			break
+		dbRawData, err = decrypt(normalizedToken, value.Data)
+		if err != nil {
+			return err
 		}
 
 		buf = bytes.NewReader(dbRawData)
@@ -397,141 +296,95 @@ func (c *Cluster) ReconcileBootstrapData(ctx context.Context, buf io.ReadSeeker,
 	}
 
 	files := make(bootstrap.PathsDataformat)
-	if err := json.NewDecoder(buf).Decode(&files); err != nil {
-		// This will fail if data is being pulled from old an cluster since
-		// older clusters used a map[string][]byte for the data structure.
-		// Therefore, we need to perform a migration to the newer bootstrap
-		// format; bootstrap.BootstrapFile.
-		buf.Seek(0, 0)
-
+	if !isMigrated(buf, &files) {
 		if err := migrateBootstrapData(ctx, buf, files); err != nil {
 			return err
 		}
-	}
-	buf.Seek(0, 0)
-
-	type update struct {
-		db, disk, conflict bool
+		buf.Seek(0, 0)
 	}
 
+	// Compare on-disk content to the datastore.
+	// If the files differ and the timestamp in the datastore is newer, data on disk will be updated.
+	// If the files differ and the timestamp on disk is newer, an error will be raised listing the conflicting files.
 	var updateDisk bool
-
-	results := make(map[string]update)
+	var newerOnDisk []string
 	for pathKey, fileData := range files {
 		path, ok := paths[pathKey]
-		if !ok {
+		if !ok || path == "" {
+			logrus.Warnf("Unable to lookup path to reconcile %s", pathKey)
 			continue
 		}
+		logrus.Debugf("Reconciling %s at '%s'", pathKey, path)
 
-		f, err := os.Open(path)
+		updated, newer, err := isNewerFile(path, fileData)
 		if err != nil {
-			if os.IsNotExist(err) {
-				logrus.Warn(path + " doesn't exist. continuing...")
-				updateDisk = true
-				continue
-			}
-			return err
+			return errors.Wrapf(err, "failed to get update status of %s", pathKey)
 		}
-		defer f.Close()
-
-		fData, err := ioutil.ReadAll(f)
-		if err != nil {
-			return err
+		if newer {
+			newerOnDisk = append(newerOnDisk, path)
 		}
 
-		if !bytes.Equal(fileData.Content, fData) {
-			info, err := os.Stat(path)
-			if err != nil {
-				return err
-			}
-
-			switch {
-			case info.ModTime().Unix()-files[pathKey].Timestamp.Unix() >= systemTimeSkew:
-				if _, ok := results[path]; !ok {
-					results[path] = update{
-						db: true,
-					}
-				}
-
-				for pk := range files {
-					p, ok := paths[pk]
-					if !ok {
-						continue
-					}
-
-					if filepath.Base(p) == info.Name() {
-						continue
-					}
-
-					i, err := os.Stat(p)
-					if err != nil {
-						return err
-					}
-
-					if i.ModTime().Unix()-files[pk].Timestamp.Unix() >= systemTimeSkew {
-						if _, ok := results[path]; !ok {
-							results[path] = update{
-								conflict: true,
-							}
-						}
-					}
-				}
-			case info.ModTime().Unix()-files[pathKey].Timestamp.Unix() <= systemTimeSkew:
-				if _, ok := results[info.Name()]; !ok {
-					results[path] = update{
-						disk: true,
-					}
-				}
-
-				for pk := range files {
-					p, ok := paths[pk]
-					if !ok {
-						continue
-					}
-
-					if filepath.Base(p) == info.Name() {
-						continue
-					}
-
-					i, err := os.Stat(p)
-					if err != nil {
-						return err
-					}
-
-					if i.ModTime().Unix()-files[pk].Timestamp.Unix() <= systemTimeSkew {
-						if _, ok := results[path]; !ok {
-							results[path] = update{
-								conflict: true,
-							}
-						}
-					}
-				}
-			default:
-				if _, ok := results[path]; ok {
-					results[path] = update{}
-				}
-			}
-		}
+		updateDisk = updateDisk || updated
 	}
 
-	for path, res := range results {
-		switch {
-		case res.disk:
-			updateDisk = true
-			logrus.Warn("datastore newer than " + path)
-		case res.db:
-			logrus.Fatal(path + " newer than datastore and could cause cluster outage. Remove the file from disk and restart to be recreated from datastore.")
-		case res.conflict:
-			logrus.Warnf("datastore / disk conflict: %s newer than in the datastore", path)
+	if c.config.ClusterReset {
+		updateDisk = true
+		serverTLSDir := filepath.Join(c.config.DataDir, "tls")
+		tlsBackupDir := filepath.Join(c.config.DataDir, "tls-"+strconv.Itoa(int(time.Now().Unix())))
+
+		logrus.Infof("Cluster reset: backing up certificates directory to " + tlsBackupDir)
+
+		if _, err := os.Stat(serverTLSDir); err != nil {
+			return errors.Wrap(err, "cluster reset failed to stat server TLS dir")
 		}
+		if err := copy.Copy(serverTLSDir, tlsBackupDir); err != nil {
+			return errors.Wrap(err, "cluster reset failed to back up server TLS dir")
+		}
+	} else if len(newerOnDisk) > 0 {
+		logrus.Fatal(strings.Join(newerOnDisk, ", ") + " newer than datastore and could cause a cluster outage. Remove the file(s) from disk and restart to be recreated from datastore.")
 	}
 
 	if updateDisk {
-		logrus.Warn("updating bootstrap data on disk from datastore")
-		return bootstrap.WriteToDiskFromStorage(buf, crb)
+		logrus.Warn("Updating bootstrap data on disk from datastore")
+		return bootstrap.WriteToDiskFromStorage(files, crb)
 	}
 
 	return nil
+}
+
+// isNewerFile compares the file from disk and datastore, and returns
+// update status.
+func isNewerFile(path string, file bootstrap.File) (updated bool, newerOnDisk bool, _ error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			logrus.Warn(path + " doesn't exist. continuing...")
+			return true, false, nil
+		}
+		return false, false, errors.Wrapf(err, "reconcile failed to open")
+	}
+	defer f.Close()
+
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return false, false, errors.Wrapf(err, "reconcile failed to read")
+	}
+
+	if bytes.Equal(file.Content, data) {
+		return false, false, nil
+	}
+
+	info, err := f.Stat()
+	if err != nil {
+		return false, false, errors.Wrapf(err, "reconcile failed to stat")
+	}
+
+	if info.ModTime().Unix()-file.Timestamp.Unix() >= systemTimeSkew {
+		return true, true, nil
+	}
+
+	logrus.Warn(path + " will be updated from the datastore.")
+	return true, false, nil
 }
 
 // httpBootstrap retrieves bootstrap data (certs and keys, etc) from the remote server via HTTP
@@ -543,12 +396,12 @@ func (c *Cluster) httpBootstrap(ctx context.Context) error {
 		return err
 	}
 
-	return c.ReconcileBootstrapData(ctx, bytes.NewReader(content), &c.config.Runtime.ControlRuntimeBootstrap, true, nil)
+	return c.ReconcileBootstrapData(ctx, bytes.NewReader(content), &c.config.Runtime.ControlRuntimeBootstrap, true)
 }
 
 func (c *Cluster) retrieveInitializedDBdata(ctx context.Context) (*bytes.Buffer, error) {
 	var buf bytes.Buffer
-	if err := bootstrap.ReadFromDisk(&buf, &c.runtime.ControlRuntimeBootstrap); err != nil {
+	if err := bootstrap.ReadFromDisk(&buf, &c.config.Runtime.ControlRuntimeBootstrap); err != nil {
 		return nil, err
 	}
 
@@ -560,7 +413,11 @@ func (c *Cluster) bootstrap(ctx context.Context) error {
 	c.joining = true
 
 	// bootstrap managed database via HTTPS
-	if c.runtime.HTTPBootstrap {
+	if c.config.Runtime.HTTPBootstrap {
+		// Assuming we should just compare on managed databases
+		if err := c.compareConfig(); err != nil {
+			return errors.Wrap(err, "failed to validate server configuration")
+		}
 		return c.httpBootstrap(ctx)
 	}
 
@@ -568,11 +425,102 @@ func (c *Cluster) bootstrap(ctx context.Context) error {
 	return c.storageBootstrap(ctx)
 }
 
-// Snapshot is a proxy method to call the snapshot method on the managedb
-// interface for etcd clusters.
-func (c *Cluster) Snapshot(ctx context.Context, config *config.Control) error {
-	if c.managedDB == nil {
-		return errors.New("unable to perform etcd snapshot on non-etcd system")
+// compareConfig verifies that the config of the joining control plane node coincides with the cluster's config
+func (c *Cluster) compareConfig() error {
+	token := c.config.AgentToken
+	if token == "" {
+		token = c.config.Token
 	}
-	return c.managedDB.Snapshot(ctx, config)
+	agentClientAccessInfo, err := clientaccess.ParseAndValidateToken(c.config.JoinURL, token, clientaccess.WithUser("node"))
+	if err != nil {
+		return err
+	}
+	serverConfig, err := agentClientAccessInfo.Get("/v1-" + version.Program + "/config")
+	if err != nil {
+		return err
+	}
+	clusterControl := &config.Control{}
+	if err := json.Unmarshal(serverConfig, clusterControl); err != nil {
+		return err
+	}
+
+	// We are saving IPs of ClusterIPRanges and ServiceIPRanges in 4-bytes representation but json decodes in 16-byte
+	ipsTo16Bytes(c.config.CriticalControlArgs.ClusterIPRanges)
+	ipsTo16Bytes(c.config.CriticalControlArgs.ServiceIPRanges)
+
+	// If the remote server is down-level and did not fill the egress-selector
+	// mode, use the local value to allow for temporary mismatch during upgrades.
+	if clusterControl.CriticalControlArgs.EgressSelectorMode == "" {
+		clusterControl.CriticalControlArgs.EgressSelectorMode = c.config.CriticalControlArgs.EgressSelectorMode
+	}
+
+	if diff := deep.Equal(c.config.CriticalControlArgs, clusterControl.CriticalControlArgs); diff != nil {
+		rc := reflect.ValueOf(clusterControl.CriticalControlArgs).Type()
+		for _, d := range diff {
+			field := strings.Split(d, ":")[0]
+			v, _ := rc.FieldByName(field)
+			if cliTag, found := v.Tag.Lookup("cli"); found {
+				logrus.Warnf("critical configuration mismatched: %s", cliTag)
+			} else {
+				logrus.Warnf("critical configuration mismatched: %s", field)
+			}
+		}
+		return errors.New("critical configuration value mismatch between servers")
+	}
+	return nil
+}
+
+// ipsTo16Bytes makes sure the IPs in the []*net.IPNet slice are represented in 16-byte format
+func ipsTo16Bytes(mySlice []*net.IPNet) {
+	for _, ipNet := range mySlice {
+		ipNet.IP = ipNet.IP.To16()
+	}
+}
+
+// reconcileEtcd starts a temporary single-member etcd cluster using a copy of the
+// etcd database, and uses it to reconcile bootstrap data. This is necessary
+// because the full etcd cluster may not have quorum during startup, but we still
+// need to extract data from the datastore.
+func (c *Cluster) reconcileEtcd(ctx context.Context) error {
+	logrus.Info("Starting temporary etcd to reconcile with datastore")
+
+	tempConfig := endpoint.ETCDConfig{Endpoints: []string{"http://127.0.0.1:2399"}}
+	originalConfig := c.config.Runtime.EtcdConfig
+	c.config.Runtime.EtcdConfig = tempConfig
+	reconcileCtx, cancel := context.WithCancel(ctx)
+
+	defer func() {
+		cancel()
+		c.config.Runtime.EtcdConfig = originalConfig
+	}()
+
+	e := etcd.NewETCD()
+	if err := e.SetControlConfig(c.config); err != nil {
+		return err
+	}
+	if err := e.StartEmbeddedTemporary(reconcileCtx); err != nil {
+		return err
+	}
+
+	for {
+		if err := e.Test(reconcileCtx); err != nil && !errors.Is(err, etcd.ErrNotMember) {
+			logrus.Infof("Failed to test temporary data store connection: %v", err)
+		} else {
+			logrus.Info(e.EndpointName() + " temporary data store connection OK")
+			break
+		}
+
+		select {
+		case <-time.After(5 * time.Second):
+		case <-reconcileCtx.Done():
+			break
+		}
+	}
+
+	data, err := c.retrieveInitializedDBdata(reconcileCtx)
+	if err != nil {
+		return err
+	}
+
+	return c.ReconcileBootstrapData(reconcileCtx, bytes.NewReader(data.Bytes()), &c.config.Runtime.ControlRuntimeBootstrap, false)
 }

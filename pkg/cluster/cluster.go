@@ -5,26 +5,28 @@ import (
 	"net/url"
 	"runtime"
 	"strings"
+	"time"
 
+	"github.com/k3s-io/k3s/pkg/clientaccess"
+	"github.com/k3s-io/k3s/pkg/cluster/managed"
+	"github.com/k3s-io/k3s/pkg/daemons/config"
+	"github.com/k3s-io/k3s/pkg/etcd"
 	"github.com/k3s-io/kine/pkg/endpoint"
 	"github.com/pkg/errors"
-	"github.com/rancher/k3s/pkg/clientaccess"
-	"github.com/rancher/k3s/pkg/cluster/managed"
-	"github.com/rancher/k3s/pkg/daemons/config"
-	"github.com/rancher/k3s/pkg/etcd"
 	"github.com/sirupsen/logrus"
+	"k8s.io/apimachinery/pkg/util/wait"
+	utilsnet "k8s.io/utils/net"
 )
 
 type Cluster struct {
 	clientAccessInfo *clientaccess.Info
 	config           *config.Control
-	runtime          *config.ControlRuntime
 	managedDB        managed.Driver
-	etcdConfig       endpoint.ETCDConfig
 	joining          bool
 	storageStarted   bool
 	saveBootstrap    bool
 	shouldBootstrap  bool
+	cnFilterFunc     func(...string) []string
 }
 
 // Start creates the dynamic tls listener, http request handler,
@@ -41,29 +43,46 @@ func (c *Cluster) Start(ctx context.Context) (<-chan struct{}, error) {
 		ready := make(chan struct{})
 		defer close(ready)
 
-		// try to get /db/info urls first before attempting to use join url
+		// try to get /db/info urls first, for a current list of etcd cluster member client URLs
 		clientURLs, _, err := etcd.ClientURLs(ctx, c.clientAccessInfo, c.config.PrivateIP)
 		if err != nil {
 			return nil, err
 		}
-		if len(clientURLs) < 1 {
+		// If we somehow got no error but also no client URLs, just use the address of the server we're joining
+		if len(clientURLs) == 0 {
 			clientURL, err := url.Parse(c.config.JoinURL)
 			if err != nil {
 				return nil, err
 			}
 			clientURL.Host = clientURL.Hostname() + ":2379"
 			clientURLs = append(clientURLs, clientURL.String())
+			logrus.Warnf("Got empty etcd ClientURL list; using server URL %s", clientURL)
 		}
-		etcdProxy, err := etcd.NewETCDProxy(ctx, true, c.config.DataDir, clientURLs[0])
+		etcdProxy, err := etcd.NewETCDProxy(ctx, c.config.SupervisorPort, c.config.DataDir, clientURLs[0], utilsnet.IsIPv6CIDR(c.config.ServiceIPRanges[0]))
 		if err != nil {
 			return nil, err
 		}
+		// immediately update the load balancer with all etcd addresses
+		// client URLs are a full URI, but the proxy only wants host:port
+		for i, c := range clientURLs {
+			u, err := url.Parse(c)
+			if err != nil {
+				return nil, errors.Wrap(err, "failed to parse etcd ClientURL")
+			}
+			clientURLs[i] = u.Host
+		}
+		etcdProxy.Update(clientURLs)
+
+		// start periodic endpoint sync goroutine
 		c.setupEtcdProxy(ctx, etcdProxy)
 
 		// remove etcd member if it exists
 		if err := c.managedDB.RemoveSelf(ctx); err != nil {
 			logrus.Warnf("Failed to remove this node from etcd members")
 		}
+
+		c.config.Runtime.EtcdConfig.Endpoints = strings.Split(c.config.Datastore.Endpoint, ",")
+		c.config.Runtime.EtcdConfig.TLSConfig = c.config.Datastore.BackendTLSConfig
 
 		return ready, nil
 	}
@@ -79,13 +98,13 @@ func (c *Cluster) Start(ctx context.Context) (<-chan struct{}, error) {
 		return nil, err
 	}
 
-	if err := c.startStorage(ctx); err != nil {
+	if err := c.startStorage(ctx, false); err != nil {
 		return nil, err
 	}
 
 	// if necessary, store bootstrap data to datastore
 	if c.saveBootstrap {
-		if err := c.save(ctx, false); err != nil {
+		if err := Save(ctx, c.config, false); err != nil {
 			return nil, err
 		}
 	}
@@ -99,16 +118,19 @@ func (c *Cluster) Start(ctx context.Context) (<-chan struct{}, error) {
 			for {
 				select {
 				case <-ready:
-					if err := c.save(ctx, false); err != nil {
+					if err := Save(ctx, c.config, false); err != nil {
 						panic(err)
 					}
 
 					if !c.config.EtcdDisableSnapshots {
-						if err := c.managedDB.ReconcileSnapshotData(ctx); err != nil {
-							logrus.Errorf("Failed to record snapshots for cluster: %v", err)
-						}
+						_ = wait.PollUntilContextCancel(ctx, time.Second, true, func(ctx context.Context) (bool, error) {
+							err := c.managedDB.ReconcileSnapshotData(ctx)
+							if err != nil {
+								logrus.Errorf("Failed to record snapshots for cluster: %v", err)
+							}
+							return err == nil, nil
+						})
 					}
-
 					return
 				default:
 					runtime.Gosched()
@@ -124,11 +146,18 @@ func (c *Cluster) Start(ctx context.Context) (<-chan struct{}, error) {
 // This calls into the kine endpoint code, which sets up the database client
 // and unix domain socket listener if using an external database. In the case of an etcd
 // backend it just returns the user-provided etcd endpoints and tls config.
-func (c *Cluster) startStorage(ctx context.Context) error {
-	if c.storageStarted {
+func (c *Cluster) startStorage(ctx context.Context, bootstrap bool) error {
+	if c.storageStarted && !c.config.KineTLS {
 		return nil
 	}
 	c.storageStarted = true
+
+	if !bootstrap {
+		// set the tls config for the kine storage
+		c.config.Datastore.ServerTLSConfig.CAFile = c.config.Runtime.ETCDServerCA
+		c.config.Datastore.ServerTLSConfig.CertFile = c.config.Runtime.ServerETCDCert
+		c.config.Datastore.ServerTLSConfig.KeyFile = c.config.Runtime.ServerETCDKey
+	}
 
 	// start listening on the kine socket as an etcd endpoint, or return the external etcd endpoints
 	etcdConfig, err := endpoint.Listen(ctx, c.config.Datastore)
@@ -139,17 +168,22 @@ func (c *Cluster) startStorage(ctx context.Context) error {
 	// Persist the returned etcd configuration. We decide if we're doing leader election for embedded controllers
 	// based on what the kine wrapper tells us about the datastore. Single-node datastores like sqlite don't require
 	// leader election, while basically all others (etcd, external database, etc) do since they allow multiple servers.
-	c.etcdConfig = etcdConfig
-	c.config.Datastore.BackendTLSConfig = etcdConfig.TLSConfig
-	c.config.Datastore.Endpoint = strings.Join(etcdConfig.Endpoints, ",")
-	c.config.NoLeaderElect = !etcdConfig.LeaderElect
+	c.config.Runtime.EtcdConfig = etcdConfig
+
+	// after the bootstrap we need to set the args for api-server with kine in unixs or just set the
+	// values if the datastoreTLS is not enabled
+	if !bootstrap || !c.config.KineTLS {
+		c.config.Datastore.BackendTLSConfig = etcdConfig.TLSConfig
+		c.config.Datastore.Endpoint = strings.Join(etcdConfig.Endpoints, ",")
+		c.config.NoLeaderElect = !etcdConfig.LeaderElect
+	}
+
 	return nil
 }
 
 // New creates an initial cluster using the provided configuration.
 func New(config *config.Control) *Cluster {
 	return &Cluster{
-		config:  config,
-		runtime: config.Runtime,
+		config: config,
 	}
 }
