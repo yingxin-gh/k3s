@@ -21,14 +21,15 @@ limitations under the License.
 package v1
 
 import (
-	k3s "github.com/rancher/k3s/pkg/apis/k3s.cattle.io"
+	k3s "github.com/k3s-io/k3s/pkg/apis/k3s.cattle.io"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 var (
-	AddonResourceName = "addons"
+	AddonResourceName            = "addons"
+	ETCDSnapshotFileResourceName = "etcdsnapshotfiles"
 )
 
 // SchemeGroupVersion is group version used to register these objects
@@ -54,6 +55,8 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 	scheme.AddKnownTypes(SchemeGroupVersion,
 		&Addon{},
 		&AddonList{},
+		&ETCDSnapshotFile{},
+		&ETCDSnapshotFileList{},
 	)
 	metav1.AddToGroupVersion(scheme, SchemeGroupVersion)
 	return nil

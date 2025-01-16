@@ -1,13 +1,17 @@
 package deps
 
 import (
+	"bytes"
 	"crypto"
 	cryptorand "crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	b64 "encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io/ioutil"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
@@ -15,16 +19,20 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/k3s-io/k3s/pkg/clientaccess"
+	"github.com/k3s-io/k3s/pkg/cloudprovider"
+	"github.com/k3s-io/k3s/pkg/daemons/config"
+	"github.com/k3s-io/k3s/pkg/passwd"
+	"github.com/k3s-io/k3s/pkg/util"
+	"github.com/k3s-io/k3s/pkg/version"
 	certutil "github.com/rancher/dynamiclistener/cert"
-	"github.com/rancher/k3s/pkg/clientaccess"
-	"github.com/rancher/k3s/pkg/daemons/config"
-	"github.com/rancher/k3s/pkg/passwd"
-	"github.com/rancher/k3s/pkg/token"
-	"github.com/rancher/k3s/pkg/version"
 	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
-	apiserverconfigv1 "k8s.io/apiserver/pkg/apis/config/v1"
+	apiserverconfigv1 "k8s.io/apiserver/pkg/apis/apiserver/v1"
+	apiserverv1beta1 "k8s.io/apiserver/pkg/apis/apiserver/v1beta1"
+	"k8s.io/apiserver/pkg/authentication/user"
+	"k8s.io/client-go/util/keyutil"
 )
 
 const (
@@ -34,8 +42,7 @@ const (
 	RequestHeaderCN = "system:auth-proxy"
 )
 
-var (
-	kubeconfigTemplate = template.Must(template.New("kubeconfig").Parse(`apiVersion: v1
+var kubeconfigTemplate = template.Must(template.New("kubeconfig").Parse(`apiVersion: v1
 clusters:
 - cluster:
     server: {{.URL}}
@@ -56,7 +63,6 @@ users:
     client-certificate: {{.ClientCert}}
     client-key: {{.ClientKey}}
 `))
-)
 
 func migratePassword(p *passwd.Passwd) error {
 	server, _ := p.Pass("server")
@@ -80,7 +86,8 @@ func KubeConfig(dest, url, caCert, clientCert, clientKey string) error {
 		ClientKey:  clientKey,
 	}
 
-	output, err := os.Create(dest)
+	// cis-1.24 and newer require kubeconfigs to be 0600
+	output, err := os.OpenFile(dest, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return err
 	}
@@ -91,7 +98,8 @@ func KubeConfig(dest, url, caCert, clientCert, clientKey string) error {
 
 // CreateRuntimeCertFiles is responsible for filling out all the
 // .crt and .key filenames for a ControlRuntime.
-func CreateRuntimeCertFiles(config *config.Control, runtime *config.ControlRuntime) {
+func CreateRuntimeCertFiles(config *config.Control) {
+	runtime := config.Runtime
 	runtime.ClientCA = filepath.Join(config.DataDir, "tls", "client-ca.crt")
 	runtime.ClientCAKey = filepath.Join(config.DataDir, "tls", "client-ca.key")
 	runtime.ServerCA = filepath.Join(config.DataDir, "tls", "server-ca.crt")
@@ -104,7 +112,12 @@ func CreateRuntimeCertFiles(config *config.Control, runtime *config.ControlRunti
 	runtime.PasswdFile = filepath.Join(config.DataDir, "cred", "passwd")
 	runtime.NodePasswdFile = filepath.Join(config.DataDir, "cred", "node-passwd")
 
+	runtime.SigningClientCA = filepath.Join(config.DataDir, "tls", "client-ca.nochain.crt")
+	runtime.SigningServerCA = filepath.Join(config.DataDir, "tls", "server-ca.nochain.crt")
+	runtime.ServiceCurrentKey = filepath.Join(config.DataDir, "tls", "service.current.key")
+
 	runtime.KubeConfigAdmin = filepath.Join(config.DataDir, "cred", "admin.kubeconfig")
+	runtime.KubeConfigSupervisor = filepath.Join(config.DataDir, "cred", "supervisor.kubeconfig")
 	runtime.KubeConfigController = filepath.Join(config.DataDir, "cred", "controller.kubeconfig")
 	runtime.KubeConfigScheduler = filepath.Join(config.DataDir, "cred", "scheduler.kubeconfig")
 	runtime.KubeConfigAPIServer = filepath.Join(config.DataDir, "cred", "api-server.kubeconfig")
@@ -112,6 +125,8 @@ func CreateRuntimeCertFiles(config *config.Control, runtime *config.ControlRunti
 
 	runtime.ClientAdminCert = filepath.Join(config.DataDir, "tls", "client-admin.crt")
 	runtime.ClientAdminKey = filepath.Join(config.DataDir, "tls", "client-admin.key")
+	runtime.ClientSupervisorCert = filepath.Join(config.DataDir, "tls", "client-supervisor.crt")
+	runtime.ClientSupervisorKey = filepath.Join(config.DataDir, "tls", "client-supervisor.key")
 	runtime.ClientControllerCert = filepath.Join(config.DataDir, "tls", "client-controller.crt")
 	runtime.ClientControllerKey = filepath.Join(config.DataDir, "tls", "client-controller.key")
 	runtime.ClientCloudControllerCert = filepath.Join(config.DataDir, "tls", "client-"+version.Program+"-cloud-controller.crt")
@@ -131,6 +146,9 @@ func CreateRuntimeCertFiles(config *config.Control, runtime *config.ControlRunti
 	runtime.ClientKubeletKey = filepath.Join(config.DataDir, "tls", "client-kubelet.key")
 	runtime.ServingKubeletKey = filepath.Join(config.DataDir, "tls", "serving-kubelet.key")
 
+	runtime.EgressSelectorConfig = filepath.Join(config.DataDir, "etc", "egress-selector-config.yaml")
+	runtime.CloudControllerConfig = filepath.Join(config.DataDir, "etc", "cloud-config.yaml")
+
 	runtime.ClientAuthProxyCert = filepath.Join(config.DataDir, "tls", "client-auth-proxy.crt")
 	runtime.ClientAuthProxyKey = filepath.Join(config.DataDir, "tls", "client-auth-proxy.key")
 
@@ -147,13 +165,15 @@ func CreateRuntimeCertFiles(config *config.Control, runtime *config.ControlRunti
 
 	if config.EncryptSecrets {
 		runtime.EncryptionConfig = filepath.Join(config.DataDir, "cred", "encryption-config.json")
+		runtime.EncryptionHash = filepath.Join(config.DataDir, "cred", "encryption-state.json")
 	}
 }
 
 // GenServerDeps is responsible for generating the cluster dependencies
 // needed to successfully bootstrap a cluster.
-func GenServerDeps(config *config.Control, runtime *config.ControlRuntime) error {
-	if err := genCerts(config, runtime); err != nil {
+func GenServerDeps(config *config.Control) error {
+	runtime := config.Runtime
+	if err := genCerts(config); err != nil {
 		return err
 	}
 
@@ -161,15 +181,23 @@ func GenServerDeps(config *config.Control, runtime *config.ControlRuntime) error
 		return err
 	}
 
-	if err := genUsers(config, runtime); err != nil {
+	if err := genUsers(config); err != nil {
 		return err
 	}
 
-	if err := genEncryptedNetworkInfo(config, runtime); err != nil {
+	if err := genEncryptedNetworkInfo(config); err != nil {
 		return err
 	}
 
-	if err := genEncryptionConfig(config, runtime); err != nil {
+	if err := genEncryptionConfigAndState(config); err != nil {
+		return err
+	}
+
+	if err := genEgressSelectorConfig(config); err != nil {
+		return err
+	}
+
+	if err := genCloudConfig(config); err != nil {
 		return err
 	}
 
@@ -202,7 +230,8 @@ func getNodePass(config *config.Control, serverPass string) string {
 	return config.AgentToken
 }
 
-func genUsers(config *config.Control, runtime *config.ControlRuntime) error {
+func genUsers(config *config.Control) error {
+	runtime := config.Runtime
 	passwd, err := passwd.Read(runtime.PasswdFile)
 	if err != nil {
 		return err
@@ -212,6 +241,7 @@ func genUsers(config *config.Control, runtime *config.ControlRuntime) error {
 		return err
 	}
 
+	// if no token is provided on bootstrap, we generate a random token
 	serverPass, err := getServerPass(passwd, config)
 	if err != nil {
 		return err
@@ -230,9 +260,10 @@ func genUsers(config *config.Control, runtime *config.ControlRuntime) error {
 	return passwd.Write(runtime.PasswdFile)
 }
 
-func genEncryptedNetworkInfo(controlConfig *config.Control, runtime *config.ControlRuntime) error {
+func genEncryptedNetworkInfo(controlConfig *config.Control) error {
+	runtime := controlConfig.Runtime
 	if s, err := os.Stat(runtime.IPSECKey); err == nil && s.Size() > 0 {
-		psk, err := ioutil.ReadFile(runtime.IPSECKey)
+		psk, err := os.ReadFile(runtime.IPSECKey)
 		if err != nil {
 			return err
 		}
@@ -240,26 +271,24 @@ func genEncryptedNetworkInfo(controlConfig *config.Control, runtime *config.Cont
 		return nil
 	}
 
-	psk, err := token.Random(ipsecTokenSize)
+	psk, err := util.Random(ipsecTokenSize)
 	if err != nil {
 		return err
 	}
 
 	controlConfig.IPSECPSK = psk
-	return ioutil.WriteFile(runtime.IPSECKey, []byte(psk+"\n"), 0600)
+	return os.WriteFile(runtime.IPSECKey, []byte(psk+"\n"), 0600)
 }
 
 func getServerPass(passwd *passwd.Passwd, config *config.Control) (string, error) {
-	var (
-		err error
-	)
+	var err error
 
 	serverPass := config.Token
 	if serverPass == "" {
 		serverPass, _ = passwd.Pass("server")
 	}
 	if serverPass == "" {
-		serverPass, err = token.Random(16)
+		serverPass, err = util.Random(16)
 		if err != nil {
 			return "", err
 		}
@@ -268,17 +297,17 @@ func getServerPass(passwd *passwd.Passwd, config *config.Control) (string, error
 	return serverPass, nil
 }
 
-func genCerts(config *config.Control, runtime *config.ControlRuntime) error {
-	if err := genClientCerts(config, runtime); err != nil {
+func genCerts(config *config.Control) error {
+	if err := genClientCerts(config); err != nil {
 		return err
 	}
-	if err := genServerCerts(config, runtime); err != nil {
+	if err := genServerCerts(config); err != nil {
 		return err
 	}
-	if err := genRequestHeaderCerts(config, runtime); err != nil {
+	if err := genRequestHeaderCerts(config); err != nil {
 		return err
 	}
-	return genETCDCerts(config, runtime)
+	return genETCDCerts(config)
 }
 
 func getSigningCertFactory(regen bool, altNames *certutil.AltNames, extKeyUsage []x509.ExtKeyUsage, caCertFile, caKeyFile string) signedCertFactory {
@@ -287,18 +316,32 @@ func getSigningCertFactory(regen bool, altNames *certutil.AltNames, extKeyUsage 
 	}
 }
 
-func genClientCerts(config *config.Control, runtime *config.ControlRuntime) error {
+func genClientCerts(config *config.Control) error {
+	runtime := config.Runtime
 	regen, err := createSigningCertKey(version.Program+"-client", runtime.ClientCA, runtime.ClientCAKey)
 	if err != nil {
+		return err
+	}
+
+	certs, err := certutil.CertsFromFile(runtime.ClientCA)
+	if err != nil {
+		return err
+	}
+
+	// If our CA certs are signed by a root or intermediate CA, ClientCA will contain a chain.
+	// The controller-manager's signer wants just a single cert, not a full chain; so create a file
+	// that is guaranteed to contain only a single certificate.
+	if err := certutil.WriteCert(runtime.SigningClientCA, certutil.EncodeCertPEM(certs[0])); err != nil {
 		return err
 	}
 
 	factory := getSigningCertFactory(regen, nil, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, runtime.ClientCA, runtime.ClientCAKey)
 
 	var certGen bool
-	apiEndpoint := fmt.Sprintf("https://127.0.0.1:%d", config.APIServerPort)
 
-	certGen, err = factory("system:admin", []string{"system:masters"}, runtime.ClientAdminCert, runtime.ClientAdminKey)
+	apiEndpoint := fmt.Sprintf("https://%s:%d", config.Loopback(true), config.APIServerPort)
+
+	certGen, err = factory("system:admin", []string{user.SystemPrivilegedGroup}, runtime.ClientAdminCert, runtime.ClientAdminKey)
 	if err != nil {
 		return err
 	}
@@ -308,7 +351,17 @@ func genClientCerts(config *config.Control, runtime *config.ControlRuntime) erro
 		}
 	}
 
-	certGen, err = factory("system:kube-controller-manager", nil, runtime.ClientControllerCert, runtime.ClientControllerKey)
+	certGen, err = factory("system:"+version.Program+"-supervisor", []string{user.SystemPrivilegedGroup}, runtime.ClientSupervisorCert, runtime.ClientSupervisorKey)
+	if err != nil {
+		return err
+	}
+	if certGen {
+		if err := KubeConfig(runtime.KubeConfigSupervisor, apiEndpoint, runtime.ServerCA, runtime.ClientSupervisorCert, runtime.ClientSupervisorKey); err != nil {
+			return err
+		}
+	}
+
+	certGen, err = factory(user.KubeControllerManager, nil, runtime.ClientControllerCert, runtime.ClientControllerKey)
 	if err != nil {
 		return err
 	}
@@ -318,7 +371,7 @@ func genClientCerts(config *config.Control, runtime *config.ControlRuntime) erro
 		}
 	}
 
-	certGen, err = factory("system:kube-scheduler", nil, runtime.ClientSchedulerCert, runtime.ClientSchedulerKey)
+	certGen, err = factory(user.KubeScheduler, nil, runtime.ClientSchedulerCert, runtime.ClientSchedulerKey)
 	if err != nil {
 		return err
 	}
@@ -328,7 +381,7 @@ func genClientCerts(config *config.Control, runtime *config.ControlRuntime) erro
 		}
 	}
 
-	certGen, err = factory("kube-apiserver", nil, runtime.ClientKubeAPICert, runtime.ClientKubeAPIKey)
+	certGen, err = factory(user.APIServerUser, []string{user.SystemPrivilegedGroup}, runtime.ClientKubeAPICert, runtime.ClientKubeAPIKey)
 	if err != nil {
 		return err
 	}
@@ -338,11 +391,11 @@ func genClientCerts(config *config.Control, runtime *config.ControlRuntime) erro
 		}
 	}
 
-	if _, err = factory("system:kube-proxy", nil, runtime.ClientKubeProxyCert, runtime.ClientKubeProxyKey); err != nil {
+	if _, _, err := certutil.LoadOrGenerateKeyFile(runtime.ClientKubeProxyKey, regen); err != nil {
 		return err
 	}
-	// This user (system:k3s-controller by default) must be bound to a role in rolebindings.yaml or the downstream equivalent
-	if _, err = factory("system:"+version.Program+"-controller", nil, runtime.ClientK3sControllerCert, runtime.ClientK3sControllerKey); err != nil {
+
+	if _, _, err := certutil.LoadOrGenerateKeyFile(runtime.ClientK3sControllerKey, regen); err != nil {
 		return err
 	}
 
@@ -363,8 +416,9 @@ func genClientCerts(config *config.Control, runtime *config.ControlRuntime) erro
 	return nil
 }
 
-func genServerCerts(config *config.Control, runtime *config.ControlRuntime) error {
-	regen, err := createServerSigningCertKey(config, runtime)
+func genServerCerts(config *config.Control) error {
+	runtime := config.Runtime
+	regen, err := createServerSigningCertKey(config)
 	if err != nil {
 		return err
 	}
@@ -389,21 +443,18 @@ func genServerCerts(config *config.Control, runtime *config.ControlRuntime) erro
 	return nil
 }
 
-func genETCDCerts(config *config.Control, runtime *config.ControlRuntime) error {
+func genETCDCerts(config *config.Control) error {
+	runtime := config.Runtime
 	regen, err := createSigningCertKey("etcd-server", runtime.ETCDServerCA, runtime.ETCDServerCAKey)
 	if err != nil {
 		return err
 	}
 
-	altNames := &certutil.AltNames{}
-	addSANs(altNames, config.SANs)
-
-	if _, err := createClientCertKey(regen, "etcd-server", nil,
-		altNames, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-		runtime.ETCDServerCA, runtime.ETCDServerCAKey,
-		runtime.ServerETCDCert, runtime.ServerETCDKey); err != nil {
-		return err
+	altNames := &certutil.AltNames{
+		DNSNames: []string{"kine.sock"},
 	}
+
+	addSANs(altNames, config.SANs)
 
 	if _, err := createClientCertKey(regen, "etcd-client", nil,
 		nil, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
@@ -424,10 +475,22 @@ func genETCDCerts(config *config.Control, runtime *config.ControlRuntime) error 
 		return err
 	}
 
+	if config.DisableETCD {
+		return nil
+	}
+
+	if _, err := createClientCertKey(regen, "etcd-server", nil,
+		altNames, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		runtime.ETCDServerCA, runtime.ETCDServerCAKey,
+		runtime.ServerETCDCert, runtime.ServerETCDKey); err != nil {
+		return err
+	}
+
 	return nil
 }
 
-func genRequestHeaderCerts(config *config.Control, runtime *config.ControlRuntime) error {
+func genRequestHeaderCerts(config *config.Control) error {
+	runtime := config.Runtime
 	regen, err := createSigningCertKey(version.Program+"-request-header", runtime.RequestHeaderCA, runtime.RequestHeaderCAKey)
 	if err != nil {
 		return err
@@ -445,7 +508,8 @@ func genRequestHeaderCerts(config *config.Control, runtime *config.ControlRuntim
 
 type signedCertFactory = func(commonName string, organization []string, certFile, keyFile string) (bool, error)
 
-func createServerSigningCertKey(config *config.Control, runtime *config.ControlRuntime) (bool, error) {
+func createServerSigningCertKey(config *config.Control) (bool, error) {
+	runtime := config.Runtime
 	TokenCA := filepath.Join(config.DataDir, "tls", "token-ca.crt")
 	TokenCAKey := filepath.Join(config.DataDir, "tls", "token-ca.key")
 
@@ -459,7 +523,24 @@ func createServerSigningCertKey(config *config.Control, runtime *config.ControlR
 		}
 		return true, nil
 	}
-	return createSigningCertKey(version.Program+"-server", runtime.ServerCA, runtime.ServerCAKey)
+	regen, err := createSigningCertKey(version.Program+"-server", runtime.ServerCA, runtime.ServerCAKey)
+	if err != nil {
+		return regen, err
+	}
+
+	// If our CA certs are signed by a root or intermediate CA, ServerCA will contain a chain.
+	// The controller-manager's signer wants just a single cert, not a full chain; so create a file
+	// that is guaranteed to contain only a single certificate.
+	certs, err := certutil.CertsFromFile(runtime.ServerCA)
+	if err != nil {
+		return regen, err
+	}
+
+	if err := certutil.WriteCert(runtime.SigningServerCA, certutil.EncodeCertPEM(certs[0])); err != nil {
+		return regen, err
+	}
+
+	return regen, nil
 }
 
 func addSANs(altNames *certutil.AltNames, sans []string) {
@@ -473,23 +554,22 @@ func addSANs(altNames *certutil.AltNames, sans []string) {
 	}
 }
 
-func sansChanged(certFile string, sans *certutil.AltNames) bool {
+func fieldsChanged(certFile string, commonName string, organization []string, sans *certutil.AltNames, caCertFile string) bool {
 	if sans == nil {
+		sans = &certutil.AltNames{}
+	}
+
+	certificates, err := certutil.CertsFromFile(certFile)
+	if err != nil || len(certificates) == 0 {
 		return false
 	}
 
-	certBytes, err := ioutil.ReadFile(certFile)
-	if err != nil {
-		return false
+	if certificates[0].Subject.CommonName != commonName {
+		return true
 	}
 
-	certificates, err := certutil.ParseCertsPEM(certBytes)
-	if err != nil {
-		return false
-	}
-
-	if len(certificates) == 0 {
-		return false
+	if !sets.NewString(certificates[0].Subject.Organization...).Equal(sets.NewString(organization...)) {
+		return true
 	}
 
 	if !sets.NewString(certificates[0].DNSNames...).HasAll(sans.DNSNames...) {
@@ -507,26 +587,17 @@ func sansChanged(certFile string, sans *certutil.AltNames) bool {
 		}
 	}
 
-	return false
+	caCertificates, err := certutil.CertsFromFile(caCertFile)
+	if err != nil || len(caCertificates) == 0 {
+		return false
+	}
+
+	return !bytes.Equal(certificates[0].AuthorityKeyId, caCertificates[0].SubjectKeyId)
 }
 
 func createClientCertKey(regen bool, commonName string, organization []string, altNames *certutil.AltNames, extKeyUsage []x509.ExtKeyUsage, caCertFile, caKeyFile, certFile, keyFile string) (bool, error) {
-	caBytes, err := ioutil.ReadFile(caCertFile)
-	if err != nil {
-		return false, err
-	}
-
-	pool := x509.NewCertPool()
-	pool.AppendCertsFromPEM(caBytes)
-
-	// check for certificate expiration
-	if !regen {
-		regen = expired(certFile, pool)
-	}
-
-	if !regen {
-		regen = sansChanged(certFile, altNames)
-	}
+	// check for reasons to renew the certificate even if not manually requested.
+	regen = regen || expired(certFile) || fieldsChanged(certFile, commonName, organization, altNames, caCertFile)
 
 	if !regen {
 		if exists(certFile, keyFile) {
@@ -534,17 +605,12 @@ func createClientCertKey(regen bool, commonName string, organization []string, a
 		}
 	}
 
-	caKeyBytes, err := ioutil.ReadFile(caKeyFile)
+	caKey, err := certutil.PrivateKeyFromFile(caKeyFile)
 	if err != nil {
 		return false, err
 	}
 
-	caKey, err := certutil.ParsePrivateKeyPEM(caKeyBytes)
-	if err != nil {
-		return false, err
-	}
-
-	caCert, err := certutil.ParseCertsPEM(caBytes)
+	caCerts, err := certutil.CertsFromFile(caCertFile)
 	if err != nil {
 		return false, err
 	}
@@ -567,12 +633,12 @@ func createClientCertKey(regen bool, commonName string, organization []string, a
 	if altNames != nil {
 		cfg.AltNames = *altNames
 	}
-	cert, err := certutil.NewSignedCert(cfg, key.(crypto.Signer), caCert[0], caKey.(crypto.Signer))
+	cert, err := certutil.NewSignedCert(cfg, key.(crypto.Signer), caCerts[0], caKey.(crypto.Signer))
 	if err != nil {
 		return false, err
 	}
 
-	return true, certutil.WriteCert(certFile, append(certutil.EncodeCertPEM(cert), certutil.EncodeCertPEM(caCert[0])...))
+	return true, certutil.WriteCert(certFile, util.EncodeCertsPEM(cert, caCerts))
 }
 
 func exists(files ...string) bool {
@@ -585,17 +651,35 @@ func exists(files ...string) bool {
 }
 
 func genServiceAccount(runtime *config.ControlRuntime) error {
-	_, keyErr := os.Stat(runtime.ServiceKey)
-	if keyErr == nil {
-		return nil
+	if _, err := os.Stat(runtime.ServiceKey); err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		key, err := certutil.NewPrivateKey()
+		if err != nil {
+			return err
+		}
+		if err := certutil.WriteKey(runtime.ServiceKey, certutil.EncodePrivateKeyPEM(key)); err != nil {
+			return err
+		}
 	}
 
-	key, err := certutil.NewPrivateKey()
+	// When rotating the ServiceAccount signing key, it is necessary to keep the old keys in ServiceKey so that
+	// old ServiceAccount tokens can be validated during the switchover process. The first key in the file
+	// should be the current key used to sign ServiceAccount tokens; others are old keys used for verification
+	// only. Create a file containing just the first key in the list, which will be used to configure the
+	// signing controller.
+	key, err := keyutil.PrivateKeyFromFile(runtime.ServiceKey)
 	if err != nil {
 		return err
 	}
 
-	return certutil.WriteKey(runtime.ServiceKey, certutil.EncodePrivateKeyPEM(key))
+	keyData, err := keyutil.MarshalPrivateKeyToPEM(key)
+	if err != nil {
+		return err
+	}
+
+	return certutil.WriteKey(runtime.ServiceCurrentKey, keyData)
 }
 
 func createSigningCertKey(prefix, certFile, keyFile string) (bool, error) {
@@ -628,36 +712,34 @@ func createSigningCertKey(prefix, certFile, keyFile string) (bool, error) {
 	return true, nil
 }
 
-func expired(certFile string, pool *x509.CertPool) bool {
-	certBytes, err := ioutil.ReadFile(certFile)
+func expired(certFile string) bool {
+	certificates, err := certutil.CertsFromFile(certFile)
 	if err != nil {
 		return false
-	}
-	certificates, err := certutil.ParseCertsPEM(certBytes)
-	if err != nil {
-		return false
-	}
-	_, err = certificates[0].Verify(x509.VerifyOptions{
-		Roots: pool,
-		KeyUsages: []x509.ExtKeyUsage{
-			x509.ExtKeyUsageAny,
-		},
-	})
-	if err != nil {
-		return true
 	}
 	return certutil.IsCertExpired(certificates[0], config.CertificateRenewDays)
 }
 
-func genEncryptionConfig(controlConfig *config.Control, runtime *config.ControlRuntime) error {
+func genEncryptionConfigAndState(controlConfig *config.Control) error {
+	runtime := controlConfig.Runtime
 	if !controlConfig.EncryptSecrets {
 		return nil
 	}
 	if s, err := os.Stat(runtime.EncryptionConfig); err == nil && s.Size() > 0 {
+		// On upgrade from older versions, the encryption hash may not exist, create it
+		if _, err := os.Stat(runtime.EncryptionHash); errors.Is(err, os.ErrNotExist) {
+			curEncryptionByte, err := os.ReadFile(runtime.EncryptionConfig)
+			if err != nil {
+				return err
+			}
+			encryptionConfigHash := sha256.Sum256(curEncryptionByte)
+			ann := "start-" + hex.EncodeToString(encryptionConfigHash[:])
+			return os.WriteFile(controlConfig.Runtime.EncryptionHash, []byte(ann), 0600)
+		}
 		return nil
 	}
 
-	aescbcKey := make([]byte, aescbcKeySize, aescbcKeySize)
+	aescbcKey := make([]byte, aescbcKeySize)
 	_, err := cryptorand.Read(aescbcKey)
 	if err != nil {
 		return err
@@ -690,9 +772,76 @@ func genEncryptionConfig(controlConfig *config.Control, runtime *config.ControlR
 			},
 		},
 	}
-	jsonfile, err := json.Marshal(encConfig)
+	b, err := json.Marshal(encConfig)
 	if err != nil {
 		return err
 	}
-	return ioutil.WriteFile(runtime.EncryptionConfig, jsonfile, 0600)
+	if err := util.AtomicWrite(runtime.EncryptionConfig, b, 0600); err != nil {
+		return err
+	}
+	encryptionConfigHash := sha256.Sum256(b)
+	ann := "start-" + hex.EncodeToString(encryptionConfigHash[:])
+	return os.WriteFile(controlConfig.Runtime.EncryptionHash, []byte(ann), 0600)
+}
+
+func genEgressSelectorConfig(controlConfig *config.Control) error {
+	var clusterConn apiserverv1beta1.Connection
+
+	if controlConfig.EgressSelectorMode == config.EgressSelectorModeDisabled {
+		clusterConn = apiserverv1beta1.Connection{
+			ProxyProtocol: apiserverv1beta1.ProtocolDirect,
+		}
+	} else {
+		clusterConn = apiserverv1beta1.Connection{
+			ProxyProtocol: apiserverv1beta1.ProtocolHTTPConnect,
+			Transport: &apiserverv1beta1.Transport{
+				TCP: &apiserverv1beta1.TCPTransport{
+					URL: fmt.Sprintf("https://%s:%d", controlConfig.BindAddressOrLoopback(false, true), controlConfig.SupervisorPort),
+					TLSConfig: &apiserverv1beta1.TLSConfig{
+						CABundle:   controlConfig.Runtime.ServerCA,
+						ClientKey:  controlConfig.Runtime.ClientKubeAPIKey,
+						ClientCert: controlConfig.Runtime.ClientKubeAPICert,
+					},
+				},
+			},
+		}
+	}
+
+	egressConfig := apiserverv1beta1.EgressSelectorConfiguration{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "EgressSelectorConfiguration",
+			APIVersion: "apiserver.k8s.io/v1beta1",
+		},
+		EgressSelections: []apiserverv1beta1.EgressSelection{
+			{
+				Name:       "cluster",
+				Connection: clusterConn,
+			},
+		},
+	}
+
+	b, err := json.Marshal(egressConfig)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(controlConfig.Runtime.EgressSelectorConfig, b, 0600)
+}
+
+func genCloudConfig(controlConfig *config.Control) error {
+	cloudConfig := cloudprovider.Config{
+		LBDefaultPriorityClassName: cloudprovider.DefaultLBPriorityClassName,
+		LBEnabled:                  !controlConfig.DisableServiceLB,
+		LBNamespace:                controlConfig.ServiceLBNamespace,
+		LBImage:                    cloudprovider.DefaultLBImage,
+		Rootless:                   controlConfig.Rootless,
+		NodeEnabled:                !controlConfig.DisableCCM,
+	}
+	if controlConfig.SystemDefaultRegistry != "" {
+		cloudConfig.LBImage = controlConfig.SystemDefaultRegistry + "/" + cloudConfig.LBImage
+	}
+	b, err := json.Marshal(cloudConfig)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(controlConfig.Runtime.CloudControllerConfig, b, 0600)
 }

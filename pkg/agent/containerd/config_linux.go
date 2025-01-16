@@ -4,24 +4,27 @@
 package containerd
 
 import (
-	"context"
-	"io/ioutil"
 	"os"
-	"time"
 
+	"github.com/containerd/containerd"
+	overlayutils "github.com/containerd/containerd/snapshots/overlay/overlayutils"
+	fuseoverlayfs "github.com/containerd/fuse-overlayfs-snapshotter"
+	stargz "github.com/containerd/stargz-snapshotter/service"
+	"github.com/docker/docker/pkg/parsers/kernel"
+	"github.com/k3s-io/k3s/pkg/agent/templates"
+	"github.com/k3s-io/k3s/pkg/cgroups"
+	"github.com/k3s-io/k3s/pkg/daemons/config"
+	"github.com/k3s-io/k3s/pkg/version"
 	"github.com/opencontainers/runc/libcontainer/userns"
 	"github.com/pkg/errors"
-	"github.com/rancher/k3s/pkg/agent/templates"
-	util2 "github.com/rancher/k3s/pkg/agent/util"
-	"github.com/rancher/k3s/pkg/cgroups"
-	"github.com/rancher/k3s/pkg/daemons/config"
-	"github.com/rancher/k3s/pkg/version"
-	"github.com/rancher/wharfie/pkg/registries"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
-	"google.golang.org/grpc"
-	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
-	"k8s.io/kubernetes/pkg/kubelet/util"
+	"k8s.io/cri-client/pkg/util"
+)
+
+const (
+	socketPrefix = "unix://"
+	runtimesPath = "/usr/local/nvidia/toolkit:/opt/kwasm/bin"
 )
 
 func getContainerdArgs(cfg *config.Node) []string {
@@ -35,30 +38,46 @@ func getContainerdArgs(cfg *config.Node) []string {
 	return args
 }
 
-// setupContainerdConfig generates the containerd.toml, using a template combined with various
+// SetupContainerdConfig generates the containerd.toml, using a template combined with various
 // runtime configurations and registry mirror settings provided by the administrator.
-func setupContainerdConfig(ctx context.Context, cfg *config.Node) error {
-	privRegistries, err := registries.GetPrivateRegistries(cfg.AgentConfig.PrivateRegistry)
-	if err != nil {
-		return err
-	}
-
+func SetupContainerdConfig(cfg *config.Node) error {
 	isRunningInUserNS := userns.RunningInUserNS()
-	_, _, hasCFS, hasPIDs := cgroups.CheckCgroups()
+	_, _, controllers := cgroups.CheckCgroups()
 	// "/sys/fs/cgroup" is namespaced
 	cgroupfsWritable := unix.Access("/sys/fs/cgroup", unix.W_OK) == nil
-	disableCgroup := isRunningInUserNS && (!hasCFS || !hasPIDs || !cgroupfsWritable)
+	disableCgroup := isRunningInUserNS && (!controllers["cpu"] || !controllers["pids"] || !cgroupfsWritable)
 	if disableCgroup {
 		logrus.Warn("cgroup v2 controllers are not delegated for rootless. Disabling cgroup.")
+	} else {
+		// note: this mutatation of the passed agent.Config is later used to set the
+		// kubelet's cgroup-driver flag. This may merit moving to somewhere else in order
+		// to avoid mutating the configuration while setting up containerd.
+		cfg.AgentConfig.Systemd = !isRunningInUserNS && controllers["cpuset"] && os.Getenv("INVOCATION_ID") != ""
 	}
 
-	var containerdTemplate string
+	// set the path to include the default runtimes and remove the aditional path entries
+	// that we added after finding the runtimes
+	originalPath := os.Getenv("PATH")
+	os.Setenv("PATH", runtimesPath+string(os.PathListSeparator)+originalPath)
+	extraRuntimes := findContainerRuntimes()
+	os.Setenv("PATH", originalPath)
+
+	// Verifies if the DefaultRuntime can be found
+	if _, ok := extraRuntimes[cfg.DefaultRuntime]; !ok && cfg.DefaultRuntime != "" {
+		return errors.Errorf("default runtime %s was not found", cfg.DefaultRuntime)
+	}
+
 	containerdConfig := templates.ContainerdConfig{
 		NodeConfig:            cfg,
 		DisableCgroup:         disableCgroup,
+		SystemdCgroup:         cfg.AgentConfig.Systemd,
 		IsRunningInUserNS:     isRunningInUserNS,
-		PrivateRegistryConfig: privRegistries.Registry(),
-		ExtraRuntimes:         findNvidiaContainerRuntimes(os.DirFS(string(os.PathSeparator))),
+		EnableUnprivileged:    kernel.CheckKernelVersion(4, 11, 0),
+		NonrootDevices:        cfg.Containerd.NonrootDevices,
+		PrivateRegistryConfig: cfg.AgentConfig.Registry,
+		ExtraRuntimes:         extraRuntimes,
+		Program:               version.Program,
+		NoDefaultEndpoint:     cfg.Containerd.NoDefault,
 	}
 
 	selEnabled, selConfigured, err := selinuxStatus()
@@ -72,43 +91,30 @@ func setupContainerdConfig(ctx context.Context, cfg *config.Node) error {
 		logrus.Warnf("SELinux is enabled for "+version.Program+" but process is not running in context '%s', "+version.Program+"-selinux policy may need to be applied", SELinuxContextType)
 	}
 
-	containerdTemplateBytes, err := ioutil.ReadFile(cfg.Containerd.Template)
-	if err == nil {
-		logrus.Infof("Using containerd template at %s", cfg.Containerd.Template)
-		containerdTemplate = string(containerdTemplateBytes)
-	} else if os.IsNotExist(err) {
-		containerdTemplate = templates.ContainerdConfigTemplate
-	} else {
-		return err
-	}
-	parsedTemplate, err := templates.ParseTemplateFromConfig(containerdTemplate, containerdConfig)
-	if err != nil {
+	if err := writeContainerdConfig(cfg, containerdConfig); err != nil {
 		return err
 	}
 
-	return util2.WriteFile(cfg.Containerd.Config, parsedTemplate)
+	return writeContainerdHosts(cfg, containerdConfig)
 }
 
-// criConnection connects to a CRI socket at the given path.
-func CriConnection(ctx context.Context, address string) (*grpc.ClientConn, error) {
-	addr, dialer, err := util.GetAddressAndDialer("unix://" + address)
+func Client(address string) (*containerd.Client, error) {
+	addr, _, err := util.GetAddressAndDialer(socketPrefix + address)
 	if err != nil {
 		return nil, err
 	}
 
-	conn, err := grpc.Dial(addr, grpc.WithInsecure(), grpc.WithTimeout(3*time.Second), grpc.WithContextDialer(dialer), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSize)))
-	if err != nil {
-		return nil, err
-	}
+	return containerd.New(addr)
+}
 
-	c := runtimeapi.NewRuntimeServiceClient(conn)
-	_, err = c.Version(ctx, &runtimeapi.VersionRequest{
-		Version: "0.1.0",
-	})
-	if err != nil {
-		conn.Close()
-		return nil, err
-	}
+func OverlaySupported(root string) error {
+	return overlayutils.Supported(root)
+}
 
-	return conn, nil
+func FuseoverlayfsSupported(root string) error {
+	return fuseoverlayfs.Supported(root)
+}
+
+func StargzSupported(root string) error {
+	return stargz.Supported(root)
 }

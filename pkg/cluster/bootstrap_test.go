@@ -8,11 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/k3s-io/kine/pkg/endpoint"
-	"github.com/rancher/k3s/pkg/bootstrap"
-	"github.com/rancher/k3s/pkg/clientaccess"
-	"github.com/rancher/k3s/pkg/cluster/managed"
-	"github.com/rancher/k3s/pkg/daemons/config"
+	"github.com/k3s-io/k3s/pkg/bootstrap"
+	"github.com/k3s-io/k3s/pkg/clientaccess"
+	"github.com/k3s-io/k3s/pkg/cluster/managed"
+	"github.com/k3s-io/k3s/pkg/daemons/config"
 )
 
 func Test_isDirEmpty(t *testing.T) {
@@ -82,15 +81,14 @@ func Test_isDirEmpty(t *testing.T) {
 func TestCluster_certDirsExist(t *testing.T) {
 	const testDataDir = "/tmp/k3s/"
 
+	testCredDir := filepath.Join(testDataDir, "server", "cred")
 	testTLSDir := filepath.Join(testDataDir, "server", "tls")
 	testTLSEtcdDir := filepath.Join(testDataDir, "server", "tls", "etcd")
 
 	type fields struct {
 		clientAccessInfo *clientaccess.Info
 		config           *config.Control
-		runtime          *config.ControlRuntime
 		managedDB        managed.Driver
-		etcdConfig       endpoint.ETCDConfig
 		shouldBootstrap  bool
 		storageStarted   bool
 		saveBootstrap    bool
@@ -110,8 +108,10 @@ func TestCluster_certDirsExist(t *testing.T) {
 				},
 			},
 			setup: func() error {
+				os.MkdirAll(testCredDir, 0700)
 				os.MkdirAll(testTLSEtcdDir, 0700)
 
+				_, _ = os.Create(filepath.Join(testCredDir, "test_file"))
 				_, _ = os.Create(filepath.Join(testTLSDir, "test_file"))
 				_, _ = os.Create(filepath.Join(testTLSEtcdDir, "test_file"))
 
@@ -128,9 +128,7 @@ func TestCluster_certDirsExist(t *testing.T) {
 			c := &Cluster{
 				clientAccessInfo: tt.fields.clientAccessInfo,
 				config:           tt.fields.config,
-				runtime:          tt.fields.runtime,
 				managedDB:        tt.fields.managedDB,
-				etcdConfig:       tt.fields.etcdConfig,
 				storageStarted:   tt.fields.storageStarted,
 				saveBootstrap:    tt.fields.saveBootstrap,
 			}
@@ -150,9 +148,7 @@ func TestCluster_migrateBootstrapData(t *testing.T) {
 	type fields struct {
 		clientAccessInfo *clientaccess.Info
 		config           *config.Control
-		runtime          *config.ControlRuntime
 		managedDB        managed.Driver
-		etcdConfig       endpoint.ETCDConfig
 		joining          bool
 		storageStarted   bool
 		saveBootstrap    bool
@@ -197,57 +193,6 @@ func TestCluster_migrateBootstrapData(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if err := migrateBootstrapData(tt.args.ctx, tt.args.data, tt.args.files); (err != nil) != tt.wantErr {
 				t.Errorf("Cluster.migrateBootstrapData() error = %v, wantErr %v", err, tt.wantErr)
-			}
-		})
-	}
-}
-
-func TestCluster_Snapshot(t *testing.T) {
-	type fields struct {
-		clientAccessInfo *clientaccess.Info
-		config           *config.Control
-		runtime          *config.ControlRuntime
-		managedDB        managed.Driver
-		etcdConfig       endpoint.ETCDConfig
-		joining          bool
-		storageStarted   bool
-		saveBootstrap    bool
-		shouldBootstrap  bool
-	}
-	type args struct {
-		ctx    context.Context
-		config *config.Control
-	}
-	tests := []struct {
-		name    string
-		fields  fields
-		args    args
-		wantErr bool
-	}{
-		{
-			name:   "Fail on non etcd cluster",
-			fields: fields{},
-			args: args{
-				ctx: context.Background(),
-			},
-			wantErr: true,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			c := &Cluster{
-				clientAccessInfo: tt.fields.clientAccessInfo,
-				config:           tt.fields.config,
-				runtime:          tt.fields.runtime,
-				managedDB:        tt.fields.managedDB,
-				etcdConfig:       tt.fields.etcdConfig,
-				joining:          tt.fields.joining,
-				storageStarted:   tt.fields.storageStarted,
-				saveBootstrap:    tt.fields.saveBootstrap,
-				shouldBootstrap:  tt.fields.shouldBootstrap,
-			}
-			if err := c.Snapshot(tt.args.ctx, tt.args.config); (err != nil) != tt.wantErr {
-				t.Errorf("Cluster.Snapshot() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}

@@ -16,43 +16,59 @@ package flannel
 
 import (
 	"fmt"
+	"math/big"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
-	"github.com/flannel-io/flannel/backend"
-	"github.com/flannel-io/flannel/network"
+	"github.com/flannel-io/flannel/pkg/backend"
 	"github.com/flannel-io/flannel/pkg/ip"
-	"github.com/flannel-io/flannel/subnet/kube"
+	"github.com/flannel-io/flannel/pkg/subnet/kube"
+	"github.com/flannel-io/flannel/pkg/trafficmngr/iptables"
+	"github.com/joho/godotenv"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
-	log "k8s.io/klog"
 
 	// Backends need to be imported for their init() to get executed and them to register
-	_ "github.com/flannel-io/flannel/backend/extension"
-	_ "github.com/flannel-io/flannel/backend/hostgw"
-	_ "github.com/flannel-io/flannel/backend/ipsec"
-	_ "github.com/flannel-io/flannel/backend/vxlan"
+	_ "github.com/flannel-io/flannel/pkg/backend/extension"
+	_ "github.com/flannel-io/flannel/pkg/backend/hostgw"
+	_ "github.com/flannel-io/flannel/pkg/backend/ipsec"
+	_ "github.com/flannel-io/flannel/pkg/backend/vxlan"
+	_ "github.com/flannel-io/flannel/pkg/backend/wireguard"
 )
 
 const (
 	subnetFile = "/run/flannel/subnet.env"
 )
 
-func flannel(ctx context.Context, flannelIface *net.Interface, flannelConf, kubeConfigFile string, netMode int) error {
+var (
+	FlannelBaseAnnotation         = "flannel.alpha.coreos.com"
+	FlannelExternalIPv4Annotation = FlannelBaseAnnotation + "/public-ip-overwrite"
+	FlannelExternalIPv6Annotation = FlannelBaseAnnotation + "/public-ipv6-overwrite"
+)
+
+func flannel(ctx context.Context, flannelIface *net.Interface, flannelConf, kubeConfigFile string, flannelIPv6Masq bool, netMode int) error {
 	extIface, err := LookupExtInterface(flannelIface, netMode)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "failed to find the interface")
 	}
 
-	sm, err := kube.NewSubnetManager(ctx, "", kubeConfigFile, "flannel.alpha.coreos.com", flannelConf, false)
+	sm, err := kube.NewSubnetManager(ctx,
+		"",
+		kubeConfigFile,
+		FlannelBaseAnnotation,
+		flannelConf,
+		false)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "failed to create the SubnetManager")
 	}
 
 	config, err := sm.GetNetworkConfig(ctx)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "failed to get the network config")
 	}
 
 	// Create a backend manager then use it to create the backend and register the network with it.
@@ -60,71 +76,120 @@ func flannel(ctx context.Context, flannelIface *net.Interface, flannelConf, kube
 
 	be, err := bm.GetBackend(config.BackendType)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "failed to create the flannel backend")
 	}
 
 	bn, err := be.RegisterNetwork(ctx, &sync.WaitGroup{}, config)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "failed to register flannel network")
+	}
+	trafficMngr := &iptables.IPTablesManager{}
+	err = trafficMngr.Init(ctx, &sync.WaitGroup{})
+	if err != nil {
+		return errors.Wrap(err, "failed to initialize flannel ipTables manager")
 	}
 
-	go network.SetupAndEnsureIPTables(network.MasqRules(config.Network, bn.Lease()), 60)
-	go network.SetupAndEnsureIPTables(network.ForwardRules(config.Network.String()), 50)
+	if netMode == (ipv4+ipv6) || netMode == ipv4 {
+		if config.Network.Empty() {
+			return errors.New("ipv4 mode requested but no ipv4 network provided")
+		}
+	}
 
-	if err := WriteSubnetFile(subnetFile, config.Network, config.IPv6Network, true, bn); err != nil {
-		// Continue, even though it failed.
-		log.Warningf("Failed to write subnet file: %s", err)
+	//setup masq rules
+	prevNetwork := ReadCIDRFromSubnetFile(subnetFile, "FLANNEL_NETWORK")
+	prevSubnet := ReadCIDRFromSubnetFile(subnetFile, "FLANNEL_SUBNET")
+
+	prevIPv6Network := ReadIP6CIDRFromSubnetFile(subnetFile, "FLANNEL_IPV6_NETWORK")
+	prevIPv6Subnet := ReadIP6CIDRFromSubnetFile(subnetFile, "FLANNEL_IPV6_SUBNET")
+	if flannelIPv6Masq {
+		err = trafficMngr.SetupAndEnsureMasqRules(ctx, config.Network, prevSubnet, prevNetwork, config.IPv6Network, prevIPv6Subnet, prevIPv6Network, bn.Lease(), 60)
 	} else {
-		log.Infof("Wrote subnet file to %s", subnetFile)
+		//set empty flannel ipv6 Network to prevent masquerading
+		err = trafficMngr.SetupAndEnsureMasqRules(ctx, config.Network, prevSubnet, prevNetwork, ip.IP6Net{}, prevIPv6Subnet, prevIPv6Network, bn.Lease(), 60)
+	}
+	if err != nil {
+		return errors.Wrap(err, "failed to setup masq rules")
+	}
+
+	//setup forward rules
+	trafficMngr.SetupAndEnsureForwardRules(ctx, config.Network, config.IPv6Network, 50)
+
+	if err := WriteSubnetFile(subnetFile, config.Network, config.IPv6Network, true, bn, netMode); err != nil {
+		// Continue, even though it failed.
+		logrus.Warningf("Failed to write flannel subnet file: %s", err)
+	} else {
+		logrus.Infof("Wrote flannel subnet file to %s", subnetFile)
 	}
 
 	// Start "Running" the backend network. This will block until the context is done so run in another goroutine.
-	log.Info("Running backend.")
+	logrus.Info("Running flannel backend.")
 	bn.Run(ctx)
 	return nil
 }
 
 func LookupExtInterface(iface *net.Interface, netMode int) (*backend.ExternalInterface, error) {
-	var ifaceAddr net.IP
-	var ifacev6Addr net.IP
+	var ifaceAddr []net.IP
+	var ifacev6Addr []net.IP
 	var err error
 
 	if iface == nil {
-		log.Info("Determining IP address of default interface")
-		if iface, err = ip.GetDefaultGatewayInterface(); err != nil {
-			return nil, fmt.Errorf("failed to get default interface: %s", err)
+		logrus.Debug("No interface defined for flannel in the config. Fetching the default gateway interface")
+		if netMode == ipv4 || netMode == (ipv4+ipv6) {
+			if iface, err = ip.GetDefaultGatewayInterface(); err != nil {
+				return nil, errors.Wrap(err, "failed to get default interface")
+			}
+		} else {
+			if iface, err = ip.GetDefaultV6GatewayInterface(); err != nil {
+				return nil, errors.Wrap(err, "failed to get default interface")
+			}
 		}
-	} else {
-		log.Info("Determining IP address of specified interface: ", iface.Name)
 	}
+	logrus.Debugf("The interface %s will be used by flannel", iface.Name)
 
-	ifaceAddr, err = ip.GetInterfaceIP4Addr(iface)
-	if err != nil {
-		return nil, fmt.Errorf("failed to find IPv4 address for interface %s", iface.Name)
-	}
-
-	if netMode == (ipv4 + ipv6) {
-		ifacev6Addr, err = ip.GetInterfaceIP6Addr(iface)
+	switch netMode {
+	case ipv4:
+		ifaceAddr, err = ip.GetInterfaceIP4Addrs(iface)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to find IPv4 address for interface")
+		}
+		logrus.Infof("The interface %s with ipv4 address %s will be used by flannel", iface.Name, ifaceAddr[0])
+		ifacev6Addr = append(ifacev6Addr, nil)
+	case ipv6:
+		ifacev6Addr, err = ip.GetInterfaceIP6Addrs(iface)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to find IPv6 address for interface")
+		}
+		logrus.Infof("The interface %s with ipv6 address %s will be used by flannel", iface.Name, ifacev6Addr[0])
+		ifaceAddr = append(ifaceAddr, nil)
+	case (ipv4 + ipv6):
+		ifaceAddr, err = ip.GetInterfaceIP4Addrs(iface)
+		if err != nil {
+			return nil, fmt.Errorf("failed to find IPv4 address for interface %s", iface.Name)
+		}
+		ifacev6Addr, err = ip.GetInterfaceIP6Addrs(iface)
 		if err != nil {
 			return nil, fmt.Errorf("failed to find IPv6 address for interface %s", iface.Name)
 		}
-
-		log.Infof("Using ipv6 address %s", ifacev6Addr)
+		logrus.Infof("Using dual-stack mode. The interface %s with ipv4 address %s and ipv6 address %s will be used by flannel", iface.Name, ifaceAddr[0], ifacev6Addr[0])
+	default:
+		ifaceAddr = append(ifaceAddr, nil)
+		ifacev6Addr = append(ifacev6Addr, nil)
 	}
+
 	if iface.MTU == 0 {
-		return nil, fmt.Errorf("failed to determine MTU for %s interface", ifaceAddr)
+		return nil, fmt.Errorf("failed to determine MTU for %s interface", iface.Name)
 	}
 
 	return &backend.ExternalInterface{
 		Iface:       iface,
-		IfaceAddr:   ifaceAddr,
-		IfaceV6Addr: ifacev6Addr,
-		ExtAddr:     ifaceAddr,
-		ExtV6Addr:   ifacev6Addr,
+		IfaceAddr:   ifaceAddr[0],
+		IfaceV6Addr: ifacev6Addr[0],
+		ExtAddr:     ifaceAddr[0],
+		ExtV6Addr:   ifacev6Addr[0],
 	}, nil
 }
 
-func WriteSubnetFile(path string, nw ip.IP4Net, nwv6 ip.IP6Net, ipMasq bool, bn backend.Network) error {
+func WriteSubnetFile(path string, nw ip.IP4Net, nwv6 ip.IP6Net, ipMasq bool, bn backend.Network, netMode int) error {
 	dir, name := filepath.Split(path)
 	os.MkdirAll(dir, 0755)
 
@@ -138,9 +203,10 @@ func WriteSubnetFile(path string, nw ip.IP4Net, nwv6 ip.IP6Net, ipMasq bool, bn 
 	// sn.IP by one
 	sn := bn.Lease().Subnet
 	sn.IP++
-
-	fmt.Fprintf(f, "FLANNEL_NETWORK=%s\n", nw)
-	fmt.Fprintf(f, "FLANNEL_SUBNET=%s\n", sn)
+	if netMode == ipv4 || netMode == (ipv4+ipv6) {
+		fmt.Fprintf(f, "FLANNEL_NETWORK=%s\n", nw)
+		fmt.Fprintf(f, "FLANNEL_SUBNET=%s\n", sn)
+	}
 
 	if nwv6.String() != emptyIPv6Network {
 		snv6 := bn.Lease().IPv6Subnet
@@ -160,4 +226,77 @@ func WriteSubnetFile(path string, nw ip.IP4Net, nwv6 ip.IP6Net, ipMasq bool, bn 
 	// atomically visible with the contents
 	return os.Rename(tempFile, path)
 	//TODO - is this safe? What if it's not on the same FS?
+}
+
+// ReadCIDRFromSubnetFile reads the flannel subnet file and extracts the value of IPv4 network CIDRKey
+func ReadCIDRFromSubnetFile(path string, CIDRKey string) ip.IP4Net {
+	prevCIDRs := ReadCIDRsFromSubnetFile(path, CIDRKey)
+	if len(prevCIDRs) == 0 {
+		logrus.Warningf("no subnet found for key: %s in file: %s", CIDRKey, path)
+		return ip.IP4Net{IP: 0, PrefixLen: 0}
+	} else if len(prevCIDRs) > 1 {
+		logrus.Errorf("error reading subnet: more than 1 entry found for key: %s in file %s: ", CIDRKey, path)
+		return ip.IP4Net{IP: 0, PrefixLen: 0}
+	} else {
+		return prevCIDRs[0]
+	}
+}
+
+func ReadCIDRsFromSubnetFile(path string, CIDRKey string) []ip.IP4Net {
+	prevCIDRs := make([]ip.IP4Net, 0)
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		prevSubnetVals, err := godotenv.Read(path)
+		if err != nil {
+			logrus.Errorf("Couldn't fetch previous %s from subnet file at %s: %v", CIDRKey, path, err)
+		} else if prevCIDRString, ok := prevSubnetVals[CIDRKey]; ok {
+			cidrs := strings.Split(prevCIDRString, ",")
+			prevCIDRs = make([]ip.IP4Net, 0)
+			for i := range cidrs {
+				_, cidr, err := net.ParseCIDR(cidrs[i])
+				if err != nil {
+					logrus.Errorf("Couldn't parse previous %s from subnet file at %s: %v", CIDRKey, path, err)
+				}
+				prevCIDRs = append(prevCIDRs, ip.FromIPNet(cidr))
+			}
+
+		}
+	}
+	return prevCIDRs
+}
+
+
+// ReadIP6CIDRFromSubnetFile reads the flannel subnet file and extracts the value of IPv6 network CIDRKey
+func ReadIP6CIDRFromSubnetFile(path string, CIDRKey string) ip.IP6Net {
+	prevCIDRs := ReadIP6CIDRsFromSubnetFile(path, CIDRKey)
+	if len(prevCIDRs) == 0 {
+		logrus.Warningf("no subnet found for key: %s in file: %s", CIDRKey, path)
+		return ip.IP6Net{IP: (*ip.IP6)(big.NewInt(0)), PrefixLen: 0}
+	} else if len(prevCIDRs) > 1 {
+		logrus.Errorf("error reading subnet: more than 1 entry found for key: %s in file %s: ", CIDRKey, path)
+		return ip.IP6Net{IP: (*ip.IP6)(big.NewInt(0)), PrefixLen: 0}
+	} else {
+		return prevCIDRs[0]
+	}
+}
+
+func ReadIP6CIDRsFromSubnetFile(path string, CIDRKey string) []ip.IP6Net {
+	prevCIDRs := make([]ip.IP6Net, 0)
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		prevSubnetVals, err := godotenv.Read(path)
+		if err != nil {
+			logrus.Errorf("Couldn't fetch previous %s from subnet file at %s: %v", CIDRKey, path, err)
+		} else if prevCIDRString, ok := prevSubnetVals[CIDRKey]; ok {
+			cidrs := strings.Split(prevCIDRString, ",")
+			prevCIDRs = make([]ip.IP6Net, 0)
+			for i := range cidrs {
+				_, cidr, err := net.ParseCIDR(cidrs[i])
+				if err != nil {
+					logrus.Errorf("Couldn't parse previous %s from subnet file at %s: %v", CIDRKey, path, err)
+				}
+				prevCIDRs = append(prevCIDRs, ip.FromIP6Net(cidr))
+			}
+
+		}
+	}
+	return prevCIDRs
 }

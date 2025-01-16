@@ -19,7 +19,7 @@ limitations under the License.
 package fake
 
 import (
-	v1 "github.com/rancher/k3s/pkg/generated/clientset/versioned/typed/k3s.cattle.io/v1"
+	v1 "github.com/k3s-io/k3s/pkg/generated/clientset/versioned/typed/k3s.cattle.io/v1"
 	rest "k8s.io/client-go/rest"
 	testing "k8s.io/client-go/testing"
 )
@@ -29,7 +29,11 @@ type FakeK3sV1 struct {
 }
 
 func (c *FakeK3sV1) Addons(namespace string) v1.AddonInterface {
-	return &FakeAddons{c, namespace}
+	return newFakeAddons(c, namespace)
+}
+
+func (c *FakeK3sV1) ETCDSnapshotFiles() v1.ETCDSnapshotFileInterface {
+	return newFakeETCDSnapshotFiles(c)
 }
 
 // RESTClient returns a RESTClient that is used to communicate
